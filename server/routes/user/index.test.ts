@@ -6,6 +6,7 @@ import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { User } from '@server/entity/User';
 import { Watchlist } from '@server/entity/Watchlist';
+import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import { checkUser, isAuthenticated } from '@server/middleware/auth';
 import authRoutes from '@server/routes/auth';
@@ -143,5 +144,57 @@ describe('GET /user/:id', () => {
     assert.strictEqual(res.status, 200);
     assert.ok(!('settings' in res.body));
     assertNoCredentials(res.body);
+  });
+});
+
+// Fork: bulk permission edit enables the Plex watchlist sync options
+describe('PUT /user (bulk permissions)', () => {
+  async function bulkEdit(permissions: number) {
+    const demo = await getRepository(User).findOneOrFail({
+      where: { email: 'demo@seerr.dev' },
+    });
+    const admin = await loginAs('admin@seerr.dev', 'test1234');
+    const res = await admin
+      .put('/user')
+      .send({ ids: [String(demo.id)], permissions });
+    assert.strictEqual(res.status, 200);
+
+    return getRepository(User).findOneOrFail({ where: { id: demo.id } });
+  }
+
+  it('enables the watchlist sync option matching the granted auto-request permission', async () => {
+    const updated = await bulkEdit(
+      Permission.REQUEST | Permission.AUTO_REQUEST_MOVIE
+    );
+
+    assert.strictEqual(
+      updated.permissions,
+      Permission.REQUEST | Permission.AUTO_REQUEST_MOVIE
+    );
+    assert.strictEqual(updated.settings?.watchlistSyncMovies, true);
+    assert.notStrictEqual(updated.settings?.watchlistSyncTv, true);
+  });
+
+  it('enables the options of a user who already has settings', async () => {
+    await seedUserSettings('demo@seerr.dev');
+
+    const updated = await bulkEdit(Permission.AUTO_REQUEST);
+
+    assert.strictEqual(updated.settings?.watchlistSyncMovies, true);
+    assert.strictEqual(updated.settings?.watchlistSyncTv, true);
+  });
+
+  it('enables both options for the global auto-request permission', async () => {
+    const updated = await bulkEdit(Permission.AUTO_REQUEST);
+
+    assert.strictEqual(updated.settings?.watchlistSyncMovies, true);
+    assert.strictEqual(updated.settings?.watchlistSyncTv, true);
+  });
+
+  it('leaves the options untouched without an auto-request permission', async () => {
+    const updated = await bulkEdit(Permission.ADMIN);
+
+    assert.notStrictEqual(updated.settings?.watchlistSyncMovies, true);
+    assert.notStrictEqual(updated.settings?.watchlistSyncTv, true);
   });
 });
