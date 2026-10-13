@@ -9,6 +9,7 @@ import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
 import { UserPushSubscription } from '@server/entity/UserPushSubscription';
+import { UserSettings } from '@server/entity/UserSettings';
 import { Watchlist } from '@server/entity/Watchlist';
 import type { WatchlistResponse } from '@server/interfaces/api/discoverInterfaces';
 import type {
@@ -533,8 +534,30 @@ router.put<
       },
     });
 
+    // Fork: granting auto-request in bulk also enables the matching Plex
+    // watchlist sync options, which are otherwise per-user settings. Explicit
+    // bits only, so that granting ADMIN does not turn them on.
+    const permissions = req.body.permissions;
+    const autoRequestMovies =
+      (permissions &
+        (Permission.AUTO_REQUEST | Permission.AUTO_REQUEST_MOVIE)) !==
+      0;
+    const autoRequestTv =
+      (permissions & (Permission.AUTO_REQUEST | Permission.AUTO_REQUEST_TV)) !==
+      0;
+
     const updatedUsers = await Promise.all(
       users.map(async (user) => {
+        if (autoRequestMovies || autoRequestTv) {
+          user.settings ??= new UserSettings({ user });
+          if (autoRequestMovies) {
+            user.settings.watchlistSyncMovies = true;
+          }
+          if (autoRequestTv) {
+            user.settings.watchlistSyncTv = true;
+          }
+        }
+
         return userRepository.save(<User>{
           ...user,
           ...{ permissions: req.body.permissions },
