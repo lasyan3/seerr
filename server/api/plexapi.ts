@@ -69,6 +69,7 @@ export interface PlexMetadata {
   addedAt: number;
   updatedAt: number;
   Media: Media[];
+  Location?: { path: string }[];
 }
 
 interface Media {
@@ -85,6 +86,7 @@ interface Media {
   container: string;
   videoFrameRate: string;
   videoProfile: string;
+  Part?: { file?: string }[];
 }
 
 interface PlexMetadataResponse {
