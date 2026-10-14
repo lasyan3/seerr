@@ -11,6 +11,11 @@ import type {
 } from '@server/api/themoviedb/interfaces';
 import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
+import {
+  hasOnlyExcludedVersions,
+  isExcludedShow,
+  keepNotExcludedVersions,
+} from '@server/lib/plexPathExclusion';
 import type {
   MediaIds,
   ProcessableSeason,
@@ -228,9 +233,17 @@ class PlexScanner
   }
 
   private async processPlexMovie(plexitem: PlexLibraryItem) {
+    // Fork: versions stored under PLEX_EXCLUDED_PATHS do not count
+    if (hasOnlyExcludedVersions(plexitem.Media)) {
+      this.log('Skipping movie stored under an excluded path', 'debug', {
+        title: plexitem.title,
+      });
+      return;
+    }
+
     const mediaIds = await this.getMediaIds(plexitem);
 
-    const has4k = plexitem.Media.some(
+    const has4k = keepNotExcludedVersions(plexitem.Media).some(
       (media) => media.videoResolution === '4k'
     );
 
@@ -302,6 +315,15 @@ class PlexScanner
     const metadata = await this.plexClient.getMetadata(ratingKey, {
       includeChildren: true,
     });
+
+    // Fork: a show whose folders are all under PLEX_EXCLUDED_PATHS does not
+    // count. Recently added episodes are resolved to their show above.
+    if (isExcludedShow(metadata.Location)) {
+      this.log('Skipping show stored under an excluded path', 'debug', {
+        title: metadata.title,
+      });
+      return;
+    }
 
     const mediaIds = await this.getMediaIds(metadata);
 

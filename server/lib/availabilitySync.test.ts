@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { beforeEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 
 import type {
   JellyfinLibraryItem,
@@ -27,10 +27,12 @@ import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import availabilitySync from '@server/lib/availabilitySync';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
 
 // --- Mock JellyfinAPI ---
@@ -2312,6 +2314,311 @@ describe('AvailabilitySync', () => {
         updated.status,
         MediaStatus.AVAILABLE,
         'Show should stay AVAILABLE when only specials were removed'
+      );
+    });
+  });
+
+  describe('Plex path exclusion (fork)', () => {
+    const MOVIES = '/media/movies';
+    const TRAILERS = '/media/umtk/movies';
+
+    function plexMovie(ratingKey: string, files: string[]): PlexMetadata {
+      const [episode] = fakePlexEpisodes(1);
+      return {
+        ...episode,
+        ratingKey,
+        guid: `plex://movie/${ratingKey}`,
+        title: `Movie ${ratingKey}`,
+        Media: files.map((file, i) => ({
+          ...episode.Media[0],
+          id: i,
+          Part: [{ file }],
+        })),
+      };
+    }
+
+    async function saveMovie(
+      tmdbId: number,
+      ratingKey: string,
+      externalServiceId?: number
+    ): Promise<void> {
+      await getRepository(Media).save(
+        new Media({
+          tmdbId,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.AVAILABLE,
+          ratingKey,
+          externalServiceId,
+          serviceId: externalServiceId ? 0 : undefined,
+        })
+      );
+    }
+
+    async function statusOf(tmdbId: number): Promise<Media> {
+      return getRepository(Media).findOneOrFail({ where: { tmdbId } });
+    }
+
+    const sendToRadarr = mock.method(
+      MediaRequestSubscriber.prototype,
+      'sendToRadarr',
+      async () => undefined
+    );
+
+    beforeEach(() => {
+      process.env.PLEX_EXCLUDED_PATHS = '/media/umtk';
+      sendToRadarr.mock.resetCalls();
+    });
+
+    afterEach(() => {
+      delete process.env.PLEX_EXCLUDED_PATHS;
+    });
+
+    it('resets a movie only stored under an excluded path to UNKNOWN unless Radarr has its file', async () => {
+      configurePlex();
+      configureRadarr([{ syncEnabled: true }]);
+
+      await saveMovie(7000, 'trailer-rk', 700);
+      await saveMovie(7001, 'plain-rk', 701);
+      await saveMovie(7003, 'downloaded-rk', 703);
+
+      getMetadataImpl = async (key) =>
+        plexMovie(
+          key,
+          key === 'plain-rk' ? [`${MOVIES}/a.mkv`] : [`${TRAILERS}/a.mkv`]
+        );
+      getMovieImpl = async (id) =>
+        ({
+          id,
+          tmdbId: id + 6300,
+          // 7000 is only a trailer
+          hasFile: id === 703,
+        }) as unknown as RadarrMovie;
+
+      await availabilitySync.run();
+
+      const trailer = await statusOf(7000);
+      assert.strictEqual(trailer.status, MediaStatus.UNKNOWN);
+      assert.strictEqual(trailer.ratingKey, null);
+      assert.strictEqual(trailer.externalServiceId, null);
+      assert.strictEqual((await statusOf(7001)).status, MediaStatus.AVAILABLE);
+      assert.strictEqual((await statusOf(7003)).status, MediaStatus.AVAILABLE);
+    });
+
+    it('keeps a movie whose Plex item also has a version outside the excluded path', async () => {
+      configurePlex();
+      await saveMovie(7002, 'merged-rk');
+
+      getMetadataImpl = async (key) =>
+        plexMovie(key, [`${TRAILERS}/a.mkv`, `${MOVIES}/a.mkv`]);
+
+      await availabilitySync.run();
+
+      assert.strictEqual((await statusOf(7002)).status, MediaStatus.AVAILABLE);
+    });
+
+    it('keeps everything when no path is configured', async () => {
+      delete process.env.PLEX_EXCLUDED_PATHS;
+      configurePlex();
+      await saveMovie(7004, 'trailer-rk');
+
+      getMetadataImpl = async (key) => plexMovie(key, [`${TRAILERS}/a.mkv`]);
+
+      await availabilitySync.run();
+
+      assert.strictEqual((await statusOf(7004)).status, MediaStatus.AVAILABLE);
+    });
+
+    it('resets a show only stored under an excluded path and all its seasons to UNKNOWN', async () => {
+      configurePlex();
+      configureSonarr([{ syncEnabled: true }]);
+
+      const media = new Media({
+        tmdbId: 7100,
+        mediaType: MediaType.TV,
+        status: MediaStatus.AVAILABLE,
+        ratingKey: 'trailer-show-rk',
+        externalServiceId: 710,
+        serviceId: 0,
+      });
+      media.seasons = [1, 2].map(
+        (seasonNumber) =>
+          new Season({
+            seasonNumber,
+            status: MediaStatus.AVAILABLE,
+            status4k: MediaStatus.UNKNOWN,
+          })
+      );
+      await getRepository(Media).save(media);
+
+      getMetadataImpl = async (key) => ({
+        ...fakePlexShow(key),
+        Location: [{ path: '/media/umtk/tv/Show' }],
+      });
+      getChildrenMetadataImpl = async (key) =>
+        key === 'trailer-show-rk'
+          ? [fakePlexSeason(1, 's1-rk'), fakePlexSeason(2, 's2-rk')]
+          : fakePlexEpisodes(10);
+      getSeriesByIdImpl = async (id) =>
+        ({
+          tvdbId: 71000,
+          id,
+          title: 'Trailer Show',
+          titleSlug: 'trailer-show',
+          monitored: true,
+          seasons: fakeSonarrSeasons(2, {}),
+          statistics: { episodeFileCount: 0 },
+        }) as unknown as SonarrSeries;
+
+      await availabilitySync.run();
+
+      const updated = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 7100 },
+        relations: ['seasons'],
+      });
+      assert.strictEqual(updated.status, MediaStatus.UNKNOWN);
+      for (const season of updated.seasons) {
+        assert.strictEqual(
+          season.status,
+          MediaStatus.UNKNOWN,
+          `Season ${season.seasonNumber} should be UNKNOWN`
+        );
+      }
+    });
+
+    async function insertRequest(
+      mediaId: number,
+      status: MediaRequestStatus,
+      type: MediaType,
+      seasons: number[] = []
+    ): Promise<number> {
+      // Listeners disabled so MediaRequestSubscriber does not reach Radarr.
+      const inserted = await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .insert()
+        .into(MediaRequest)
+        .values({
+          status,
+          media: { id: mediaId },
+          requestedBy: { id: 1 },
+          type,
+          is4k: false,
+        })
+        .callListeners(false)
+        .execute();
+      const requestId = inserted.identifiers[0].id;
+      for (const seasonNumber of seasons) {
+        await getRepository(SeasonRequest).save(
+          new SeasonRequest({
+            seasonNumber,
+            status,
+            request: { id: requestId } as MediaRequest,
+          })
+        );
+      }
+      return requestId;
+    }
+
+    it('reopens the completed request of a movie and marks it requested', async () => {
+      configurePlex();
+      await saveMovie(7300, 'completed-rk', 730);
+      const requestId = await insertRequest(
+        (await statusOf(7300)).id,
+        MediaRequestStatus.COMPLETED,
+        MediaType.MOVIE
+      );
+
+      getMetadataImpl = async (key) => plexMovie(key, [`${TRAILERS}/a.mkv`]);
+
+      await availabilitySync.run();
+
+      const updated = await statusOf(7300);
+      const request = await getRepository(MediaRequest).findOneOrFail({
+        where: { id: requestId },
+      });
+      assert.strictEqual(updated.status, MediaStatus.PROCESSING);
+      assert.strictEqual(updated.ratingKey, null);
+      assert.strictEqual(
+        updated.externalServiceId,
+        730,
+        'the Radarr link is kept while the request is in flight'
+      );
+      assert.strictEqual(request.status, MediaRequestStatus.APPROVED);
+      assert.strictEqual(
+        sendToRadarr.mock.callCount(),
+        0,
+        'a reopened request must not be sent to Radarr again'
+      );
+    });
+
+    it('marks a movie with only a pending request as pending', async () => {
+      configurePlex();
+      await saveMovie(7301, 'pending-rk');
+      const requestId = await insertRequest(
+        (await statusOf(7301)).id,
+        MediaRequestStatus.PENDING,
+        MediaType.MOVIE
+      );
+
+      getMetadataImpl = async (key) => plexMovie(key, [`${TRAILERS}/a.mkv`]);
+
+      await availabilitySync.run();
+
+      const request = await getRepository(MediaRequest).findOneOrFail({
+        where: { id: requestId },
+      });
+      assert.strictEqual((await statusOf(7301)).status, MediaStatus.PENDING);
+      assert.strictEqual(request.status, MediaRequestStatus.PENDING);
+    });
+
+    it('reopens the completed request of a show and marks the requested seasons', async () => {
+      configurePlex();
+
+      const media = new Media({
+        tmdbId: 7400,
+        mediaType: MediaType.TV,
+        status: MediaStatus.AVAILABLE,
+        ratingKey: 'requested-show-rk',
+      });
+      media.seasons = [1, 2].map(
+        (seasonNumber) =>
+          new Season({
+            seasonNumber,
+            status: MediaStatus.AVAILABLE,
+            status4k: MediaStatus.UNKNOWN,
+          })
+      );
+      await getRepository(Media).save(media);
+      const requestId = await insertRequest(
+        media.id,
+        MediaRequestStatus.COMPLETED,
+        MediaType.TV,
+        [1]
+      );
+
+      getMetadataImpl = async (key) => ({
+        ...fakePlexShow(key),
+        Location: [{ path: '/media/umtk/tv/Show' }],
+      });
+
+      await availabilitySync.run();
+
+      const updated = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 7400 },
+        relations: ['seasons'],
+      });
+      const request = await getRepository(MediaRequest).findOneOrFail({
+        where: { id: requestId },
+      });
+      const seasonStatus = (n: number) =>
+        updated.seasons.find((s) => s.seasonNumber === n)?.status;
+
+      assert.strictEqual(updated.status, MediaStatus.PROCESSING);
+      assert.strictEqual(seasonStatus(1), MediaStatus.PROCESSING);
+      assert.strictEqual(seasonStatus(2), MediaStatus.UNKNOWN);
+      assert.strictEqual(request.status, MediaRequestStatus.APPROVED);
+      assert.strictEqual(
+        request.seasons[0].status,
+        MediaRequestStatus.APPROVED
       );
     });
   });
