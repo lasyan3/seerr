@@ -16,11 +16,18 @@ import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import type Season from '@server/entity/Season';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import {
+  hasOnlyExcludedVersions,
+  isExcludedShow,
+  keepNotExcludedVersions,
+} from '@server/lib/plexPathExclusion';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { getHostname } from '@server/utils/getHostname';
+import { In } from 'typeorm';
 
 class AvailabilitySync {
   public running = false;
@@ -139,6 +146,8 @@ class AvailabilitySync {
         if (media.mediaType === 'movie') {
           let movieExists = false;
           let movieExists4k = false;
+          let excludedTitle: string | undefined;
+          let excludedTitle4k: string | undefined;
 
           // if (mediaServerType === MediaServerType.PLEX) {
           //   await this.mediaExistsInPlex(media, false);
@@ -154,9 +163,12 @@ class AvailabilitySync {
 
           // plex
           if (mediaServerType === MediaServerType.PLEX) {
-            const { existsInPlex } = await this.mediaExistsInPlex(media, false);
-            const { existsInPlex: existsInPlex4k } =
-              await this.mediaExistsInPlex(media, true);
+            const plexResult = await this.mediaExistsInPlex(media, false);
+            const plexResult4k = await this.mediaExistsInPlex(media, true);
+            const existsInPlex = plexResult.existsInPlex;
+            const existsInPlex4k = plexResult4k.existsInPlex;
+            excludedTitle = plexResult.excludedTitle;
+            excludedTitle4k = plexResult4k.excludedTitle;
 
             if (existsInPlex || existsInRadarr) {
               movieExists = true;
@@ -213,11 +225,19 @@ class AvailabilitySync {
           }
 
           if (!movieExists && media.status === MediaStatus.AVAILABLE) {
-            await this.mediaUpdater(media, false, mediaServerType);
+            if (excludedTitle !== undefined) {
+              await this.excludedPathResetter(media, false, excludedTitle);
+            } else {
+              await this.mediaUpdater(media, false, mediaServerType);
+            }
           }
 
           if (!movieExists4k && media.status4k === MediaStatus.AVAILABLE) {
-            await this.mediaUpdater(media, true, mediaServerType);
+            if (excludedTitle4k !== undefined) {
+              await this.excludedPathResetter(media, true, excludedTitle4k);
+            } else {
+              await this.mediaUpdater(media, true, mediaServerType);
+            }
           }
         }
 
@@ -229,11 +249,15 @@ class AvailabilitySync {
 
           //plex
 
-          const { existsInPlex, seasonsMap: plexSeasonsMap = new Map() } =
-            await this.mediaExistsInPlex(media, false);
+          const {
+            existsInPlex,
+            seasonsMap: plexSeasonsMap = new Map(),
+            excludedTitle,
+          } = await this.mediaExistsInPlex(media, false);
           const {
             existsInPlex: existsInPlex4k,
             seasonsMap: plexSeasonsMap4k = new Map(),
+            excludedTitle: excludedTitle4k,
           } = await this.mediaExistsInPlex(media, true);
 
           //jellyfin
@@ -421,7 +445,11 @@ class AvailabilitySync {
                 (season) => season.status === MediaStatus.PARTIALLY_AVAILABLE
               ))
           ) {
-            await this.mediaUpdater(media, false, mediaServerType);
+            if (excludedTitle !== undefined) {
+              await this.excludedPathResetter(media, false, excludedTitle);
+            } else {
+              await this.mediaUpdater(media, false, mediaServerType);
+            }
           }
 
           if (
@@ -435,12 +463,21 @@ class AvailabilitySync {
                 (season) => season.status4k === MediaStatus.PARTIALLY_AVAILABLE
               ))
           ) {
-            await this.mediaUpdater(media, true, mediaServerType);
+            if (excludedTitle4k !== undefined) {
+              await this.excludedPathResetter(media, true, excludedTitle4k);
+            } else {
+              await this.mediaUpdater(media, true, mediaServerType);
+            }
           }
 
           // TODO: Figure out how to run seasonUpdater for each season
 
-          if ([...finalSeasons.values()].includes(false)) {
+          // Fork: seasons of a show reset by excludedPathResetter are already
+          // handled
+          if (
+            !(excludedTitle !== undefined && !showExists) &&
+            [...finalSeasons.values()].includes(false)
+          ) {
             await this.seasonUpdater(
               media,
               finalSeasons,
@@ -449,7 +486,10 @@ class AvailabilitySync {
             );
           }
 
-          if ([...finalSeasons4k.values()].includes(false)) {
+          if (
+            !(excludedTitle4k !== undefined && !showExists4k) &&
+            [...finalSeasons4k.values()].includes(false)
+          ) {
             await this.seasonUpdater(
               media,
               finalSeasons4k,
@@ -474,6 +514,123 @@ class AvailabilitySync {
 
   public cancel() {
     this.running = false;
+  }
+
+  // Fork: a version only stored under PLEX_EXCLUDED_PATHS goes back to the
+  // status it had before Seerr took the excluded file for the media:
+  // - its completed requests are reopened (APPROVED, without being sent to
+  //   Radarr/Sonarr again) so that the real file completes them later,
+  // - PROCESSING ("Requested") when an approved request covers it, PENDING
+  //   when only a pending one does, UNKNOWN otherwise; seasons alike.
+  private async excludedPathResetter(
+    media: Media,
+    is4k: boolean,
+    title: string
+  ): Promise<void> {
+    const mediaRepository = getRepository(Media);
+    const requestRepository = getRepository(MediaRequest);
+    const statusKey = is4k ? 'status4k' : 'status';
+
+    try {
+      const requests = await requestRepository.find({
+        where: {
+          media: { id: media.id },
+          is4k,
+          status: In([
+            MediaRequestStatus.PENDING,
+            MediaRequestStatus.APPROVED,
+            MediaRequestStatus.COMPLETED,
+          ]),
+        },
+      });
+
+      const reopenedIds = requests
+        .filter((request) => request.status === MediaRequestStatus.COMPLETED)
+        .map((request) => request.id);
+      if (reopenedIds.length > 0) {
+        // Listeners disabled: an approval would send the request to
+        // Radarr/Sonarr again
+        await requestRepository
+          .createQueryBuilder()
+          .update()
+          .set({ status: MediaRequestStatus.APPROVED })
+          .whereInIds(reopenedIds)
+          .callListeners(false)
+          .execute();
+        await getRepository(SeasonRequest)
+          .createQueryBuilder()
+          .update()
+          .set({ status: MediaRequestStatus.APPROVED })
+          .where('requestId IN (:...ids)', { ids: reopenedIds })
+          .andWhere('status = :status', {
+            status: MediaRequestStatus.COMPLETED,
+          })
+          .callListeners(false)
+          .execute();
+        for (const request of requests) {
+          if (reopenedIds.includes(request.id)) {
+            request.status = MediaRequestStatus.APPROVED;
+          }
+        }
+      }
+
+      const statusFromRequests = (matching: MediaRequest[]): MediaStatus =>
+        matching.some((r) => r.status === MediaRequestStatus.APPROVED)
+          ? MediaStatus.PROCESSING
+          : matching.length > 0
+            ? MediaStatus.PENDING
+            : MediaStatus.UNKNOWN;
+
+      media[statusKey] = statusFromRequests(requests);
+      for (const season of media.seasons ?? []) {
+        if (
+          season[statusKey] === MediaStatus.AVAILABLE ||
+          season[statusKey] === MediaStatus.PARTIALLY_AVAILABLE
+        ) {
+          season[statusKey] = statusFromRequests(
+            requests.filter((request) =>
+              request.seasons?.some(
+                (s) => s.seasonNumber === season.seasonNumber
+              )
+            )
+          );
+        }
+      }
+      if (media.mediaType === 'tv') {
+        media.lastSeasonChange = new Date();
+      }
+
+      // The ratingKey points to the excluded item. The Radarr/Sonarr link is
+      // kept while a request is in flight, as mediaUpdater does.
+      media[is4k ? 'ratingKey4k' : 'ratingKey'] = null;
+      if (media[statusKey] !== MediaStatus.PROCESSING) {
+        media[is4k ? 'serviceId4k' : 'serviceId'] = null;
+        media[is4k ? 'externalServiceId4k' : 'externalServiceId'] = null;
+        media[is4k ? 'externalServiceSlug4k' : 'externalServiceSlug'] = null;
+      }
+
+      logger.info(
+        `The ${is4k ? '4K' : 'non-4K'} ${media.mediaType} "${title}" [TMDB ID ${
+          media.tmdbId
+        }] is only stored under an excluded path. Status reset to ${MediaStatus[
+          media[statusKey]
+        ].toLowerCase()}${
+          reopenedIds.length > 0
+            ? `, request(s) ${reopenedIds.join(', ')} reopened`
+            : ''
+        }.`,
+        { label: 'AvailabilitySync' }
+      );
+
+      await mediaRepository.save(media);
+    } catch (ex) {
+      logger.debug(
+        `Failure resetting the ${is4k ? '4K' : 'non-4K'} ${
+          media.mediaType
+        } "${title}" [TMDB ID ${media.tmdbId}] stored under an excluded path.`,
+        { errorMessage: ex.message, label: 'AvailabilitySync' }
+      );
+    }
   }
 
   private async *loadAvailableMediaPaginated(pageSize: number) {
@@ -871,11 +1028,44 @@ class AvailabilitySync {
   private async mediaExistsInPlex(
     media: Media,
     is4k: boolean
-  ): Promise<{ existsInPlex: boolean; seasonsMap?: Map<number, boolean> }> {
+  ): Promise<{
+    existsInPlex: boolean;
+    seasonsMap?: Map<number, boolean>;
+    /** Fork: Plex title, set when all of its files are excluded */
+    excludedTitle?: string;
+  }> {
     const ratingKey = media.ratingKey;
     const ratingKey4k = media.ratingKey4k;
     let existsInPlex = false;
     let preventSeasonSearch = false;
+    let excludedTitle: string | undefined;
+
+    // Fork: drop the versions stored under PLEX_EXCLUDED_PATHS, and the whole
+    // item when nothing else is left
+    const withoutExcludedFiles = (
+      plexMedia: PlexMetadata | undefined
+    ): PlexMetadata | undefined => {
+      if (!plexMedia) {
+        return plexMedia;
+      }
+      if (
+        media.mediaType === 'movie'
+          ? hasOnlyExcludedVersions(plexMedia.Media)
+          : isExcludedShow(plexMedia.Location)
+      ) {
+        excludedTitle = plexMedia.title;
+        logger.debug(
+          `The ${is4k ? '4K' : 'non-4K'} ${media.mediaType} "${
+            plexMedia.title
+          }" [TMDB ID ${media.tmdbId}] is only stored under an excluded path and will be treated as absent from Plex.`,
+          { label: 'AvailabilitySync' }
+        );
+        return undefined;
+      }
+      return media.mediaType === 'movie'
+        ? { ...plexMedia, Media: keepNotExcludedVersions(plexMedia.Media) }
+        : plexMedia;
+    };
 
     // Check each plex instance to see if the media still exists
     // If found, we will assume the media exists and prevent removal
@@ -884,9 +1074,11 @@ class AvailabilitySync {
       let plexMedia: PlexMetadata | undefined;
 
       if (ratingKey && !is4k) {
-        plexMedia = await this.plexClient?.getMetadata(ratingKey);
+        plexMedia = withoutExcludedFiles(
+          await this.plexClient?.getMetadata(ratingKey)
+        );
 
-        if (media.mediaType === 'tv') {
+        if (media.mediaType === 'tv' && excludedTitle === undefined) {
           this.plexSeasonsCache[ratingKey] =
             await this.plexClient?.getChildrenMetadata(ratingKey);
         }
@@ -903,9 +1095,11 @@ class AvailabilitySync {
       }
 
       if (ratingKey4k && is4k) {
-        plexMedia = await this.plexClient?.getMetadata(ratingKey4k);
+        plexMedia = withoutExcludedFiles(
+          await this.plexClient?.getMetadata(ratingKey4k)
+        );
 
-        if (media.mediaType === 'tv') {
+        if (media.mediaType === 'tv' && excludedTitle === undefined) {
           this.plexSeasonsCache[ratingKey4k] =
             await this.plexClient?.getChildrenMetadata(ratingKey4k);
         }
@@ -971,6 +1165,13 @@ class AvailabilitySync {
           }
         );
       }
+    }
+
+    // Fork: an excluded show has no season in Plex either
+    if (excludedTitle !== undefined) {
+      return media.mediaType === 'tv'
+        ? { existsInPlex, seasonsMap: new Map(), excludedTitle }
+        : { existsInPlex, excludedTitle };
     }
 
     // Here we check each season in plex for availability
